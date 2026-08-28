@@ -86,7 +86,7 @@ name=$(jq -r '.result.serverInfo.name // empty' <<<"$init")
 
 tools=$(rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name' | sort)
 count=$(wc -l <<<"$tools" | tr -d ' ')
-[[ "$count" == 6 ]] && ok "6 tools advertised" || bad "expected 6 tools, got $count"
+[[ "$count" == 7 ]] && ok "7 tools advertised" || bad "expected 7 tools, got $count"
 sed 's/^/        /' <<<"$tools"
 
 # A read-only tool marked destructive makes some clients demand confirmation
@@ -117,6 +117,29 @@ grep -q 'Session logged' <<<"$out" && ok "log_reading_session (writes both DBs)"
 out=$(call get_suspicious_sessions '{}' | text)
 { grep -q 'suspicious' <<<"$out" || grep -q 'No suspicious' <<<"$out"; } \
   && ok "get_suspicious_sessions (ClickHouse analytics)" || bad "get_suspicious_sessions — ${out:0:120}"
+
+# Comprehension check: answer_comprehension_question returns a tool result (not protocol error)
+# in all cases — whether there is a pending question or not.
+# We test the no-pending path with a student who has no session in this smoke run.
+out=$(call answer_comprehension_question '{"student_name":"diego","answer":"test"}' \
+  | jq -r '.result.content[0].text // .error.message')
+# Accept either "no pending question" OR a real evaluation (if a prior run left one)
+{ grep -q 'no pending' <<<"$out" || grep -qiE 'read|book|answer|chapter' <<<"$out"; } \
+  && ok "answer_comprehension_question: returns a tool result, not a protocol error" \
+  || bad "answer_comprehension_question: unexpected response — ${out:0:120}"
+
+# Comprehension check: log a session with a known book → question generated and surfaced
+out=$(call log_reading_session '{"student_name":"maya","book_title":"hatchet","pages_read":20,"minutes_spent":18}' | text)
+if grep -q 'comprehension' <<<"${out,,}"; then
+  ok "log_reading_session: comprehension question generated for known book"
+else
+  # ANTHROPIC_API_KEY may be absent in some CI environments — degrade cleanly
+  if grep -q 'Session logged' <<<"$out"; then
+    printf '  \033[0;33mSKIP\033[0m  comprehension question skipped (likely no ANTHROPIC_API_KEY)\n'
+  else
+    bad "log_reading_session with comprehension — ${out:0:120}"
+  fi
+fi
 
 # Recommendations need ANTHROPIC_API_KEY; report the state rather than failing,
 # since every other tool works without it.

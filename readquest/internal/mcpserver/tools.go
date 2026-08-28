@@ -22,6 +22,7 @@ var toolNames = []string{
 	"get_class_dashboard",
 	"recommend_book",
 	"get_suspicious_sessions",
+	"answer_comprehension_question",
 }
 
 // registerTools wires the domain onto the MCP surface.
@@ -91,6 +92,21 @@ func (s *Server) registerTools() {
 		mcp.WithString("class_name",
 			mcp.Description("Optional class name. Omit when there is only one class.")),
 	), s.handleDashboard)
+
+	s.mcp.AddTool(mcp.NewTool("answer_comprehension_question",
+		mcp.WithDescription(
+			"Submit a student's answer to their pending comprehension question. Use this "+
+				"immediately after the student responds to the question you asked following "+
+				"their reading session. Returns Claude's gentle evaluation of whether the "+
+				"answer suggests the student actually read the book. XP is not affected — "+
+				"the evaluation is feedback, not a gate."),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true), // calls Claude to evaluate
+		mcp.WithString("student_name", mcp.Required(),
+			mcp.Description("The student's name. A first name or partial name is fine.")),
+		mcp.WithString("answer", mcp.Required(),
+			mcp.Description("The student's verbatim answer to the comprehension question.")),
+	), s.handleAnswerQuestion)
 
 	s.mcp.AddTool(mcp.NewTool("get_suspicious_sessions",
 		mcp.WithDescription(
@@ -198,6 +214,95 @@ func (s *Server) handleLogSession(ctx context.Context, req mcp.CallToolRequest) 
 	if res.BookWasCreated {
 		fmt.Fprintf(&b, "\nNote: %q was not in the catalogue, so it was added with an unknown "+
 			"genre. Mention this in case the title was misheard.\n", res.Book.Title)
+	}
+
+	// Generate a comprehension question and append it to the response.
+	// The question is generated after the session is committed so a Claude
+	// failure never blocks XP from being awarded.
+	//
+	// The final instruction tells the model what to do next — without it,
+	// the model may continue the conversation instead of asking the question.
+	question := s.generateAndStoreQuestion(ctx, res)
+	if question != "" {
+		fmt.Fprintf(&b, "\nComprehension check — ask the student this question before continuing:\n\n")
+		fmt.Fprintf(&b, "  %s\n\n", question)
+		fmt.Fprintf(&b, "Once the student answers, call answer_comprehension_question with their response.\n")
+	}
+
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+// generateAndStoreQuestion calls Claude and persists the question. It returns
+// an empty string on any failure rather than surfacing errors: question
+// generation is best-effort and must never disrupt a session that has already
+// been committed.
+func (s *Server) generateAndStoreQuestion(ctx context.Context, res *reading.SessionResult) string {
+	if s.app.Recommender == nil {
+		return ""
+	}
+	// Auto-created placeholder books have genre 'Unknown' and no real content.
+	// Generating a question for "The Test Book 20260828" would be embarrassing
+	// mid-demo and meaningless as a comprehension check.
+	if res.Book.Genre == "Unknown" {
+		return ""
+	}
+
+	question, err := s.app.Recommender.GenerateComprehensionQuestion(ctx, res.Book.Title, res.Book.Genre)
+	if err != nil {
+		slog.Warn("comprehension question generation failed — session unaffected",
+			"book", res.Book.Title, "error", err)
+		return ""
+	}
+
+	if _, err := s.app.Reading.StoreQuestion(
+		ctx, res.SessionID, res.Student.ID, res.Book.Title, question,
+	); err != nil {
+		slog.Warn("storing comprehension question failed — session unaffected",
+			"book", res.Book.Title, "error", err)
+		return ""
+	}
+	return question
+}
+
+func (s *Server) handleAnswerQuestion(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	studentName, err := req.RequireString("student_name")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	answer, err := req.RequireString("answer")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	pending, err := s.app.Reading.GetPendingQuestion(ctx, studentName)
+	if err != nil {
+		return toolError("answer_comprehension_question", err)
+	}
+
+	// Evaluate with Claude. On failure, store a blank evaluation rather than
+	// surfacing an error — the answer is still recorded for teacher review.
+	var evaluation string
+	if s.app.Recommender != nil {
+		evaluation, err = s.app.Recommender.EvaluateAnswer(ctx, pending.BookTitle, pending.Question, answer)
+		if err != nil {
+			slog.Warn("answer evaluation failed — recording answer without evaluation",
+				"book", pending.BookTitle, "error", err)
+		}
+	}
+
+	if err := s.app.Reading.RecordAnswer(ctx, pending.ID, answer, evaluation); err != nil {
+		return toolError("answer_comprehension_question", err)
+	}
+
+	slog.Info("comprehension answer recorded",
+		"book", pending.BookTitle, "student", studentName,
+		"has_evaluation", evaluation != "")
+
+	var b strings.Builder
+	if evaluation != "" {
+		b.WriteString(evaluation)
+	} else {
+		b.WriteString("Thanks for answering — your response has been noted.")
 	}
 	return mcp.NewToolResultText(b.String()), nil
 }
@@ -371,7 +476,9 @@ func (s *Server) handleSuspiciousSessions(ctx context.Context, req mcp.CallToolR
 func toolError(tool string, err error) (*mcp.CallToolResult, error) {
 	var resErr *reading.ResolutionError
 	switch {
-	case errors.As(err, &resErr), errors.Is(err, reading.ErrInvalidInput):
+	case errors.As(err, &resErr),
+		errors.Is(err, reading.ErrInvalidInput),
+		errors.Is(err, reading.ErrNoPendingQuestion):
 		slog.Info("tool call rejected", "tool", tool, "reason", err)
 		return mcp.NewToolResultError(err.Error()), nil
 	default:

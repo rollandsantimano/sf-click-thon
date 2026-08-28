@@ -76,6 +76,7 @@ type Book struct {
 
 // SessionResult is what the chat layer narrates back to the student.
 type SessionResult struct {
+	SessionID    int // needed to link a comprehension question to this session
 	Student      Student
 	Book         Book
 	PagesRead    int
@@ -136,13 +137,14 @@ func (s *Store) LogSession(ctx context.Context, studentName, bookTitle string, p
 		return nil, err
 	}
 
+	var sessionID int
 	var sessionDate time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO reading_sessions (student_id, book_id, pages_read, minutes_spent)
 		VALUES ($1, $2, $3, $4)
-		RETURNING session_date`,
+		RETURNING id, session_date`,
 		student.ID, book.ID, pages, minutes,
-	).Scan(&sessionDate)
+	).Scan(&sessionID, &sessionDate)
 	if err != nil {
 		return nil, fmt.Errorf("recording session: %w", err)
 	}
@@ -187,6 +189,7 @@ func (s *Store) LogSession(ctx context.Context, studentName, bookTitle string, p
 	student.StreakDays = streak
 
 	result := &SessionResult{
+		SessionID:      sessionID,
 		Student:        *student,
 		Book:           *book,
 		PagesRead:      pages,

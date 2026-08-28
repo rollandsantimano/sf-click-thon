@@ -119,15 +119,17 @@ readquest/
 └── PLAN.md
 ```
 
-### MCP tools (5)
+### MCP tools (7)
 
 | Tool | R/W | What it does |
 |---|---|---|
-| `log_reading_session` | W | Log session → PG transaction (XP, streak, badge check) + CH event insert |
+| `log_reading_session` | W | PG transaction (XP, streak, badges) + CH event + Claude comprehension question |
 | `get_student_progress` | R | XP, level, streak, badges earned, gap to next badge, recent reads |
 | `get_book_list` | R | Catalogue filtered by genre/title fragment |
 | `get_class_dashboard` | R | 3-step cross-DB merge: at-risk ranking |
 | `recommend_book` | R | Claude Opus 5, low effort, age band inferred from reading history |
+| `get_suspicious_sessions` | R | ClickHouse: rate anomaly (`pages/min > 2`) + burst logging (`>2 sessions/day`) |
+| `answer_comprehension_question` | W | Claude evaluates free-text answer; stored in Postgres for teacher review |
 
 ### Postgres schema (source of truth)
 
@@ -152,6 +154,34 @@ ClickHouse cannot join Postgres. The merge runs in Go:
 3. **Go** — left-join roster onto activity; students absent from ClickHouse result have NEVER read (highest risk)
 
 At-risk if: `DaysSinceRead == nil` (never) OR `DaysSinceRead >= 7` OR `VelocityPerDay < 10.0`.
+
+### Anti-cheating architecture
+
+Reward-hacking is addressed at three levels — each handled by the platform best suited to it:
+
+**Level 1 — Hard cap (Go server, write time)**
+`validateSession` rejects any session where `pages ÷ minutes > 5`. Physiologically implausible; never stored. Error message explains the threshold to the student.
+
+**Level 2 — ClickHouse analytics (`get_suspicious_sessions`)**
+Two queries over `reading_events`, both running entirely in ClickHouse:
+- Rate anomaly: `toFloat64(pages_read) / toFloat64(minutes_spent) > 2.0` — sessions worth a teacher's second look
+- Burst logging: `count() > 2` grouped by `(student_name, session_date)` — flagging same-day session batches
+
+Results are merged in Go and surfaced through a teacher-facing MCP tool. No Postgres involved. A judge can ask "are any sessions suspicious?" in natural language and ClickHouse answers from the 30-day event history.
+
+**Level 3 — Comprehension check (Claude + LibreChat)**
+After every `log_reading_session` call for a book with a known genre:
+1. Claude generates one plot-specific question (e.g. "What was the first word Charlotte spun?") using only the title and genre — no stored question bank
+2. The question is stored in `session_questions` (Postgres) linked to the session
+3. The agent presents the question in the same chat turn with a cue to call `answer_comprehension_question`
+4. The student's free-text answer is passed to Claude for evaluation — warm, qualitative, no rubric
+5. Answer + evaluation stored in `session_questions` for teacher review
+
+XP is awarded before the question fires. The comprehension check is friction, not a gate: the cost of a false positive (a genuine reader who expressed themselves poorly) outweighs the cost of a motivated cheater who looked up a plot summary.
+
+The comprehension check is the only feature that requires a genuine multi-turn conversational exchange rather than a single tool call. It is the clearest demonstration of LibreChat as an interface and Claude doing something SQL cannot.
+
+Skipped for `Unknown`-genre books (auto-created placeholders) — generating a question for a fabricated title would be misleading.
 
 ### Claude integration (recommend_book)
 
@@ -189,9 +219,11 @@ At-risk if: `DaysSinceRead == nil` (never) OR `DaysSinceRead >= 7` OR `VelocityP
 | 3 Reading domain | ✓ done | 10 integration tests against live DBs |
 | 4 Badges + progress | ✓ done | badge double-award and Unknown exclusion tested |
 | 5 At-risk dashboard | ✓ done | 13 unit tests on pure assess/sort functions |
-| 6 MCP server | ✓ done | 14 assertions in scripts/mcp-smoke.sh |
+| 6 MCP server | ✓ done | 18 assertions in scripts/mcp-smoke.sh |
 | 7 Book recommendations | ✓ done | Claude Opus 5, live call confirmed |
-| 8 ngrok + LibreChat | ✓ done | all 5 tools confirmed through live chat |
+| 8 ngrok + LibreChat | ✓ done | all 7 tools confirmed through live chat |
+| — Suspicious sessions | ✓ done | ClickHouse rate anomaly + burst detection; `get_suspicious_sessions` MCP tool |
+| — Comprehension check | ✓ done | Claude generates question post-session; evaluates free-text answer; stored in PG |
 
 **Verified through ClickHouse Agent chat:**
 - `log_reading_session` — Maya Hatchet, Amara Charlotte's Web (badge fired)
