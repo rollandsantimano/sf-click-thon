@@ -1,0 +1,6 @@
+# Secrets — never commit. See .env.example for the required shape.
+.env
+
+# Build output
+/readquest
+/bin/
