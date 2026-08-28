@@ -27,6 +27,13 @@ import (
 const (
 	maxPagesPerSession   = 2000
 	maxMinutesPerSession = 1440 // a full day
+
+	// maxPagesPerMinute is the hard ceiling rejected at write time.
+	// Sustained reading above 5 pages/minute is physiologically implausible
+	// for a child — even a fast adult reader manages ~2 pages/minute.
+	// Sessions above 2 pages/minute are flagged as suspicious but not blocked;
+	// that threshold lives in the dashboard package.
+	maxPagesPerMinute = 5
 )
 
 // XP awarded per session: a flat participation grant plus one point per page,
@@ -243,6 +250,10 @@ func validateSession(pages, minutes int) error {
 	case minutes > maxMinutesPerSession:
 		return fmt.Errorf("%w: %d minutes exceeds a single day (max %d)",
 			ErrInvalidInput, minutes, maxMinutesPerSession)
+	case pages/minutes > maxPagesPerMinute:
+		return fmt.Errorf("%w: %d pages in %d minutes (%.1f pages/min) is not plausible — "+
+			"even a fast reader manages about 2 pages/minute",
+			ErrInvalidInput, pages, minutes, float64(pages)/float64(minutes))
 	}
 	return nil
 }

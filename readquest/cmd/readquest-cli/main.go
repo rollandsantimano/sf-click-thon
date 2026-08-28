@@ -68,6 +68,12 @@ func dispatch(cmd string, args []string) error {
 		return cmdEvents(ctx, a)
 	case "progress":
 		return cmdProgress(ctx, a, args)
+	case "suspicious":
+		var class string
+		if len(args) > 0 {
+			class = args[0]
+		}
+		return cmdSuspicious(ctx, a, class)
 	case "recommend":
 		return cmdRecommend(ctx, a, args)
 	case "dashboard":
@@ -92,6 +98,7 @@ func usage() {
   students                                  list students with XP, level, streak
   books [filter]                            list the catalogue
   progress <student>                        one student's badges, totals and recent reads
+  suspicious [class]                        sessions that may indicate reward-hacking
   recommend <student>                       ask Claude what the student should read next
   dashboard [class]                         teacher view: students ranked by who needs attention
   events                                    per-student rollup from ClickHouse analytics
@@ -159,6 +166,37 @@ func cmdBooks(ctx context.Context, a *app.App, filter string) error {
 		return err
 	}
 	return w.Flush()
+}
+
+func cmdSuspicious(ctx context.Context, a *app.App, class string) error {
+	sessions, err := a.Dashboard.SuspiciousSessions(ctx, class)
+	if err != nil {
+		return err
+	}
+
+	if len(sessions) == 0 {
+		fmt.Println("\nNo suspicious sessions detected in the last 30 days.")
+		fmt.Println()
+		return nil
+	}
+
+	fmt.Printf("\n%d suspicious session(s) detected (last 30 days)\n", len(sessions))
+	w := table("\n  STUDENT\tDATE\tPAGES\tMIN\tRATE\tFLAG")
+	for _, ss := range sessions {
+		rate := "-"
+		if ss.PagesPerMinute > 0 {
+			rate = fmt.Sprintf("%.1f/min", ss.PagesPerMinute)
+		}
+		fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%s\t%s\n",
+			ss.StudentName, ss.SessionDate.Format("2006-01-02"),
+			ss.PagesRead, ss.MinutesSpent, rate, ss.Reason)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	fmt.Println("\n  Flagged for teacher review — not automatically penalised.")
+	fmt.Println()
+	return nil
 }
 
 func cmdRecommend(ctx context.Context, a *app.App, args []string) error {

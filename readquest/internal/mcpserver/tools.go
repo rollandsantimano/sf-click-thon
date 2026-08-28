@@ -21,6 +21,7 @@ var toolNames = []string{
 	"get_book_list",
 	"get_class_dashboard",
 	"recommend_book",
+	"get_suspicious_sessions",
 }
 
 // registerTools wires the domain onto the MCP surface.
@@ -90,6 +91,21 @@ func (s *Server) registerTools() {
 		mcp.WithString("class_name",
 			mcp.Description("Optional class name. Omit when there is only one class.")),
 	), s.handleDashboard)
+
+	s.mcp.AddTool(mcp.NewTool("get_suspicious_sessions",
+		mcp.WithDescription(
+			"For teachers: identify reading sessions that may indicate reward-hacking or "+
+				"cheating. Flags two patterns: sessions with an implausibly high reading rate "+
+				"(more than 2 pages per minute) and students who logged multiple sessions on "+
+				"the same day. Use this when a teacher wants to verify session integrity, or "+
+				"when a student's XP suddenly jumps in a way that seems inconsistent with "+
+				"their past reading. Returns sessions from the last 30 days."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
+		mcp.WithString("class_name",
+			mcp.Description("Optional class name. Omit when there is only one class.")),
+	), s.handleSuspiciousSessions)
 
 	s.mcp.AddTool(mcp.NewTool("recommend_book",
 		mcp.WithDescription(
@@ -315,6 +331,35 @@ func lastReadPhrase(daysSince *int) string {
 	default:
 		return fmt.Sprintf("%d days ago", *daysSince)
 	}
+}
+
+func (s *Server) handleSuspiciousSessions(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	className := req.GetString("class_name", "")
+
+	sessions, err := s.app.Dashboard.SuspiciousSessions(ctx, className)
+	if err != nil {
+		return toolError("get_suspicious_sessions", err)
+	}
+
+	if len(sessions) == 0 {
+		return mcp.NewToolResultText(
+			"No suspicious sessions detected in the last 30 days. " +
+				"All recorded reading rates and session patterns look plausible."), nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d suspicious session(s) detected in the last 30 days:\n\n", len(sessions))
+	for i, ss := range sessions {
+		fmt.Fprintf(&b, "%d. %s — %s\n", i+1, ss.StudentName, ss.Reason)
+		if ss.BookTitle != "" {
+			fmt.Fprintf(&b, "   Book: %s (%s), %d pages in %d min\n",
+				ss.BookTitle, ss.Genre, ss.PagesRead, ss.MinutesSpent)
+		}
+		fmt.Fprintf(&b, "   Date: %s\n", ss.SessionDate.Format("2006-01-02"))
+	}
+	b.WriteString("\nThese are flagged for teacher review, not automatically penalised. ")
+	b.WriteString("Consider following up with the student directly.")
+	return mcp.NewToolResultText(b.String()), nil
 }
 
 // toolError decides whether a failure is the model's problem or ours.

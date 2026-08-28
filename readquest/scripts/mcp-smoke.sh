@@ -86,7 +86,7 @@ name=$(jq -r '.result.serverInfo.name // empty' <<<"$init")
 
 tools=$(rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name' | sort)
 count=$(wc -l <<<"$tools" | tr -d ' ')
-[[ "$count" == 5 ]] && ok "5 tools advertised" || bad "expected 5 tools, got $count"
+[[ "$count" == 6 ]] && ok "6 tools advertised" || bad "expected 6 tools, got $count"
 sed 's/^/        /' <<<"$tools"
 
 # A read-only tool marked destructive makes some clients demand confirmation
@@ -113,6 +113,10 @@ grep -q 'Maya Chen' <<<"$out" && ok "get_student_progress (fuzzy name)" || bad "
 
 out=$(call log_reading_session '{"student_name":"maya","book_title":"hatchet","pages_read":12,"minutes_spent":10}' | text)
 grep -q 'Session logged' <<<"$out" && ok "log_reading_session (writes both DBs)" || bad "log_reading_session — ${out:0:120}"
+
+out=$(call get_suspicious_sessions '{}' | text)
+{ grep -q 'suspicious' <<<"$out" || grep -q 'No suspicious' <<<"$out"; } \
+  && ok "get_suspicious_sessions (ClickHouse analytics)" || bad "get_suspicious_sessions — ${out:0:120}"
 
 # Recommendations need ANTHROPIC_API_KEY; report the state rather than failing,
 # since every other tool works without it.
